@@ -1,0 +1,635 @@
+#Comparing Sparse Penalisation Approaches
+
+#load libraries
+if(T){
+  library(L0Learn)
+  library(GEOquery)
+  library(caret)
+  library(glmnet)
+  library(reshape2)
+  library(ggplot2)
+  library(huge)
+  library(RColorBrewer)
+}
+
+#functions
+if(T){
+  
+  qrdc_func <- function(X){
+    q <- qr(X)
+    X_dc <- X[,q$pivot[seq(q$rank)]]
+    return(X_dc)
+  }
+  
+  cos_sim <- function(a, b){
+    sum(a*b)/sqrt(sum(a^2)*sum(b^2))
+  }
+  
+  pve_func <- function(y, y_hat){
+    1-(mean((y-y_hat)^2)/mean((y-mean(y))^2))
+  }
+  
+  rr_func <- function(opt_y_hat, y_hat){
+    mean((opt_y_hat-y_hat)^2)/mean(opt_y_hat^2)
+  }
+  
+  rte_func <- function(y, y_hat, noise_var){
+    mean((y-y_hat)^2)/noise_var
+  }
+
+}
+
+#import data
+if(T){
+  
+  if(F){
+    
+    #BreastCa
+    if(T){
+      GSE73002 <- getGEO("GSE73002")
+      X_GSE73002 <- t(exprs(GSE73002[[1]]))
+    }
+    
+    #LungCa
+    if(T){
+      GSE137140 <- getGEO("GSE137140")
+      X_GSE137140 <- t(exprs(GSE137140[[1]]))
+    }
+    
+    #HeadNeckCa
+    if(T){
+      GSE103322_file <- "D:/Projects/Datasets/GEO/GSE103322_HNSCC_all_data.txt/HNSCC_all_data.txt"
+      GSE103322 <- read.delim(GSE103322_file,
+                              row.names = 1)
+      colnames(GSE103322) <- NULL
+      GSE103322 <- GSE103322[-c(1,2,4,5),]
+      GSE103322[] <- lapply(GSE103322, as.numeric)
+      GSE103322 <- as.matrix(GSE103322)
+      GSE103322 <- t(GSE103322)
+      X_GSE103322 <- GSE103322[,-1]
+      colnames(X_GSE103322) <- substr(colnames(X_GSE103322),
+                                      start=2, stop=nchar(colnames(X_GSE103322))-1)
+      mean_non_zero <- colMeans(X_GSE103322!=0)
+      most_complete_cols <- order(mean_non_zero, decreasing=T)[1:1000]
+      X_GSE103322 <- X_GSE103322[,most_complete_cols]
+    }
+    
+    #OvarianCa
+    if(T){
+      GSE146026_file <- "D:/Projects/Datasets/GEO/GSE146026_Izar_HGSOC_ascites_10x_log.tsv"
+      GSE146026 <- read.delim( GSE146026_file,
+                               row.names = 1)
+      GSE146026 <-  GSE146026[-(1:7),]
+      GSE146026[] <- lapply(GSE146026, as.numeric)
+      GSE146026 <- as.matrix(GSE146026)
+      X_GSE146026 <- t(GSE146026)
+      mean_non_zero <- colMeans(X_GSE146026!=0)
+      most_complete_cols <- order(mean_non_zero, decreasing=T)[1:1000]
+      X_GSE146026 <- X_GSE146026[,most_complete_cols]
+    }
+    
+    #Astrocytoma
+    if(T){
+      GSE89567_file <- "D:/Projects/Datasets/GEO/GSE89567_IDH_A_processed_data.txt"
+      GSE89567 <- read.delim(GSE89567_file,
+                             row.names = 1)
+      GSE89567 <- as.matrix(GSE89567)
+      X_GSE89567 <- t(GSE89567)
+      mean_non_zero <- colMeans(X_GSE89567!=0)
+      most_complete_cols <- order(mean_non_zero, decreasing=T)[1:1000]
+      X_GSE89567 <- X_GSE89567[,most_complete_cols]
+    }
+    
+    data_list <- list(GSE73002=X_GSE73002,
+                      GSE137140=X_GSE137140,
+                      GSE103322=X_GSE103322,
+                      GSE146026=X_GSE146026,
+                      GSE89567=X_GSE89567
+    )
+    
+    #apply non-paranormal transformation
+    data_list <- lapply(data_list, huge.npn)
+    
+    #perform qr decompostion to retain a full column rank matrix
+    data_list <- lapply(data_list, qrdc_func)
+    
+    save(data_list, file="data_list_26_04_21.RData")
+  }
+  if(T){
+    load("data_list_26_04_21.RData")
+  }
+  
+}
+
+#data description
+if(T){
+  
+  dataset_descriptions <- data.frame(
+    GEO_Accession=c("GSE73002", "GSE137140", "GSE103322", "GSE146026", "GSE89567"),
+    Observations=sapply(data_list, nrow),
+    Variables=sapply(data_list, ncol),
+    Type=rep(c("miRNA", "scRNA"), times=c(2,3))
+  )
+  rownames(dataset_descriptions)<- NULL
+  
+  write.csv(dataset_descriptions,
+            'tables/dataset_descriptions.csv',
+            row.names = F)
+}
+
+#setup experiment parameters
+if(T){
+  param_df <- expand.grid(
+    dataset = names(data_list),
+    n_train = c(25, 75, 150),
+    rep = 1:50,
+    nv=500
+  )
+}
+
+#run experiments
+if(T){
+  
+  all_experiments_start_time <- Sys.time()
+  all_experiments <- list()
+  penalty_types <- c("L0", "L0L1", "L0L2", "L1", "L1L2")
+  for(params_i in 1:nrow(param_df)){
+    
+    message(params_i, "...")
+    
+    #get parameters for this experiment
+    params_list <- param_df[params_i,]
+    n_train <- params_list$n_train
+    dataset <- params_list$dataset
+    type <- params_list$type
+    nv <- params_list$nv
+    
+    #sample training and test data
+    X_all <- data_list[[dataset]]
+    train_obs <- sample(nrow(X_all), size=n_train)
+    test_obs <- setdiff(1:nrow(X_all), train_obs)
+    
+    sample_vars <- sample(ncol(X_all), size=nv+1)
+    X <- X_all[,sample_vars[-1]]
+    X_train <- X[train_obs,]
+    X_test <- X[test_obs,]
+    y <- X_all[,sample_vars[1]]
+    y_train <- y[train_obs]
+    y_test <- y[test_obs]
+    
+    #fit model to all observations
+    full_model <- lm(y~.,
+                     data=data.frame(X,y=y))
+    noise_var <-  var(full_model$residuals)
+    signal_var <- var(y)-noise_var
+    snr <- signal_var/noise_var
+    y_test_opt <- full_model$fitted.values[test_obs]
+    
+    #infer significant coefficients
+    true_coefs <- coef(full_model)[-1]
+    coef_pvals <- summary(full_model)$coefficients[-1,4]
+    coef_pvals_all <- true_coefs
+    coef_pvals_fdr <- p.adjust(coef_pvals, method="fdr")
+    significant_coefs <- factor(coef_pvals_fdr<0.05, levels = c("FALSE", "TRUE"))
+    n_nonzero <- sum(significant_coefs=="TRUE")
+    
+    #infer penalised models using training data
+    experiment_i <- lapply(penalty_types, function(penalty_i){
+      
+      message(penalty_i)
+      
+      #Train Model
+      if(penalty_i=="L0"){
+        start_time <- Sys.time()
+        cv_fit <- L0Learn.cvfit(x=X_train,
+                                y=y_train,
+                                penalty=penalty_i,
+                                loss="SquaredError",
+                                nFolds=5,
+                                intercept=F
+        )
+        run_time <- difftime(Sys.time(),
+                             start_time,
+                             units = "secs")
+        
+        rm(.Random.seed, envir=globalenv())
+        
+        opt_lambda_idx <-  which.min((cv_fit$cvMeans)[[1]])[1]
+        opt_lambda <- lambda_vec[opt_lambda_idx]
+        opt_gamma <- 0
+        
+        nonzero_L0 <- opt_lambda>0
+        nonzero_L1 <- F
+        nonzero_L2 <- F
+        
+        beta_hat <- coef(cv_fit, lambda=opt_lambda, gamma=opt_gamma)
+        
+        #multiple models may be returned if they have equivalent coefficients
+        if(ncol(beta_hat)>1){
+          beta_hat <- c(beta_hat[,1])
+        }else{
+          beta_hat <- c(as.matrix(beta_hat))
+        }
+      }
+      if(penalty_i=="L0L1"){
+        start_time <- Sys.time()
+        cv_fit <- L0Learn.cvfit(x=X_train,
+                                y=y_train,
+                                penalty=penalty_i,
+                                loss="SquaredError",
+                                nFolds=5,
+                                intercept=F
+        )
+        run_time <- difftime(Sys.time(),
+                             start_time,
+                             units = "secs")
+        
+        rm(.Random.seed, envir=globalenv())
+        
+        opt_gamma_idx <- which.min(sapply(cv_fit$cvMeans, min))[1]
+        opt_lambda_idx <-  which.min(cv_fit$cvMeans[[opt_gamma_idx]])[1]
+        opt_gamma <- cv_fit$fit$gamma[opt_gamma_idx]
+        opt_lambda <- cv_fit$fit$lambda[[opt_gamma_idx]][opt_lambda_idx]
+        
+        nonzero_L0 <- opt_lambda>0
+        nonzero_L1 <- opt_gamma>0
+        nonzero_L2 <- F
+        
+        beta_hat <- coef(cv_fit, lambda=opt_lambda, gamma=opt_gamma)
+        
+        #multiple models may be returned if they have equivalent coefficients
+        if(ncol(beta_hat)>1){
+          beta_hat <- c(beta_hat[,1])
+        }else{
+          beta_hat <- c(as.matrix(beta_hat))
+        }
+      }
+      if(penalty_i=="L0L2"){
+        start_time <- Sys.time()
+        cv_fit <- L0Learn.cvfit(x=X_train,
+                                y=y_train,
+                                penalty=penalty_i,
+                                loss="SquaredError",
+                                nFolds=5,
+                                intercept=F
+        )
+        run_time <- difftime(Sys.time(),
+                             start_time,
+                             units = "secs")
+        
+        rm(.Random.seed, envir=globalenv())
+        
+        opt_gamma_idx <- which.min(sapply(cv_fit$cvMeans, min))[1]
+        opt_lambda_idx <-  which.min(cv_fit$cvMeans[[opt_gamma_idx]])[1]
+        opt_gamma <- cv_fit$fit$gamma[opt_gamma_idx]
+        opt_lambda <- cv_fit$fit$lambda[[opt_gamma_idx]][opt_lambda_idx]
+        
+        nonzero_L0 <- opt_lambda>0
+        nonzero_L1 <- F
+        nonzero_L2 <- opt_gamma>0
+        
+        beta_hat <- coef(cv_fit, lambda=opt_lambda, gamma=opt_gamma)
+        
+        #multiple models may be returned if they have equivalent coefficients
+        if(ncol(beta_hat)>1){
+          beta_hat <- c(beta_hat[,1])
+        }else{
+          beta_hat <- c(as.matrix(beta_hat))
+        }
+      }
+      if(penalty_i=="L1"){
+      
+      start_time <- Sys.time()
+      cv_fit <- cv.glmnet(x=X_train,
+                          y=y_train,
+                          nfolds=5,
+                          intercept=F,
+                          lambda.min.ratio=1e-4)
+      run_time <- difftime(Sys.time(),
+                           start_time,
+                           units = "secs")
+      opt_lambda <- cv_fit$lambda.min
+      beta_hat <- as.matrix(coef(cv_fit, lambda=opt_lambda))[-1]
+
+      nonzero_L0 <- F
+      nonzero_L1 <- opt_lambda>0
+      nonzero_L2 <- F
+      
+      }
+      if(penalty_i=="L1L2"){
+        
+        start_time <- Sys.time()
+        alpha_vec <- seq(from=0,
+                         to=1,
+                         length.out=10)
+        foldid <- sample(rep(1:5, length.out=n_train))
+        cv_fits <- lapply(alpha_vec, function(alpha_i){
+          cv.glmnet(x=X_train,
+                    y=y_train,
+                    foldid=foldid,
+                    alpha=alpha_i,
+                    intercept=F,
+                    lambda.min.ratio=1e-4)
+        })
+        run_time <- difftime(Sys.time(),
+                             start_time,
+                             units = "secs")
+        
+        opt_alpha_idx <- which.min(sapply(cv_fits, function(cv_fit_i){
+          min(cv_fit_i$cvm)[1]
+        }))[1]
+        
+        cv_fit <- cv_fits[[opt_alpha_idx]]
+        beta_hat <- as.matrix(coef(cv_fit))[-1]
+        
+        nonzero_L0 <- F
+        nonzero_L1 <- opt_lambda>0 & (opt_alpha_idx>0)
+        nonzero_L2 <- opt_lambda>0 & (opt_alpha_idx<1)
+        
+      }
+      
+      #make predictions
+      y_test_hat <- c(as.matrix(predict(
+        object=cv_fit,
+        newx=X_test,
+        lambda=opt_lambda,
+        gamma=opt_gamma,
+        alpha=opt_alpha)))
+      
+      #measure test performance
+      rr_test <- rr_func(opt_y_hat = y_test_opt,
+                         y_hat = y_test_hat
+      )
+      rte_test <- rte_func(y = y_test,
+                           y_hat = y_test_hat,
+                           noise_var = noise_var)
+      pve_test <- pve_func(y = y_test,
+                           y_hat = y_test_hat)
+      
+      #variable selection performance
+      selection_performance <- caret::confusionMatrix(
+        data=factor(beta_hat!=0, levels = c("FALSE", "TRUE")),
+        reference=significant_coefs,
+        positive="TRUE"
+      )$byClass[c("Precision", "Recall", "F1")]
+      
+      beta_similarity <- cos_sim(beta_hat, true_coefs)
+      
+      output_list <- list(experiment=params_i,
+                          penalty=penalty_i,
+                          n_train =n_train,
+                          dataset=dataset,
+                          snr=snr,
+                          rr=rr_test,
+                          rte=rte_test,
+                          pve=pve_test,
+                          precision=selection_performance[1],
+                          recall=selection_performance[2],
+                          f1=selection_performance[3],
+                          beta_similarity=beta_similarity,
+                          time=run_time,
+                          n_nonzero_coefs = n_nonzero,
+                          n_nonzero_coefs_hat = sum(beta_hat!=0),
+                          nonzero_L0=nonzero_L0,
+                          nonzero_L1=nonzero_L1,
+                          nonzero_L2=nonzero_L2
+      )
+      return(output_list)
+    })
+    experiment_i <- do.call(rbind.data.frame, experiment_i)
+    
+    
+    #update list
+    all_experiments[[params_i]] <- experiment_i
+    
+  }
+  all_experiments_run_time <-  difftime(Sys.time(),
+                                        all_experiments_start_time,
+                                        units = "hours")
+
+  
+}
+
+#save experiments
+if(T){
+  save(all_experiments, file="all_experiments_25_05_21.RData")
+}
+
+#reload experiments
+if(T){
+  load("all_experiments_25_05_21.RData")
+}
+
+#reformat experiment data
+if(T){
+  
+  all_experiments_rbound <- do.call(rbind, all_experiments)
+  all_experiments_rbound$n_train <- paste0("n=",  all_experiments_rbound$n_train)
+  all_experiments_rbound$n_train <- factor(all_experiments_rbound$n_train,
+                                           levels=unique(all_experiments_rbound$n_train))
+  all_experiments_rbound$dataset <- factor(all_experiments_rbound$dataset)
+  all_experiments_melted <- all_experiments_rbound
+  
+  all_experiments_melted <- melt(all_experiments_melted, id=c("experiment", "penalty", "n_train","dataset"))
+  colnames(all_experiments_melted)<- gsub("variable", "metric",
+                                          colnames(all_experiments_melted)) 
+
+  all_experiments_melted$value[is.na(all_experiments_melted$value)&
+                                 all_experiments_melted$metric%in%c(
+                                   "precision", "recall", "f1", "beta_similarity"
+                                 )
+  ] <- 0
+  all_experiments_melted$value[is.nan(all_experiments_melted$value)&
+                                 all_experiments_melted$metric%in%c(
+                                   "precision", "recall", "f1", "beta_similarity"
+                                 )
+  ] <- 0
+  all_experiments_melted$metric <- gsub("beta_similarity", "coefficient_similarity", all_experiments_melted$metric )
+
+  
+}
+
+#plotting
+if(T){
+  
+  
+  reg_metrics <- c("rr", "rte", "pve")
+  reg_df <- all_experiments_melted[all_experiments_melted$metric%in%reg_metrics,]
+  reg_df$metric2 <- factor(c("Proportion of Variance Explained", "Relative Risk", "Relative Test Error")[factor(reg_df$metric)])
+  reg_plot <- ggplot(
+    data=reg_df,
+    aes(x=n_train,y=value, colour=penalty))+
+    geom_boxplot(coef=NULL)+
+    facet_grid(metric2~., scales="free_y")+
+    ylab(NULL)+
+    xlab(NULL)+
+    scale_color_brewer(palette = "Dark2")
+  reg_plot$labels$colour <- "Penalty"
+  
+  ggsave(plot=reg_plot,
+         filename='figures/reg_plot.jpg',
+         dpi=1500,
+         units='in',
+         width = 7,
+         height = 6)
+  
+  vs_metrics <- c("precision","recall","f1","coefficient_similarity")
+  vs_df <- all_experiments_melted[all_experiments_melted$metric%in%vs_metrics,]
+  vs_df$metric2 <- factor(c("Coefficient Similarity", "F1 Score", "Precision", "Recall")[factor(vs_df$metric)],
+                          levels = c("Coefficient Similarity", "Precision", "Recall","F1 Score")
+                          )
+  vs_plot <- ggplot(
+    data=vs_df,
+    aes(x=n_train,y=value, colour=penalty))+
+    geom_boxplot(coef=NULL)+
+    facet_grid(metric2~., scales="free_y")+
+    ylab(NULL)+
+    xlab(NULL)+
+    scale_color_brewer(palette = "Dark2")
+  vs_plot$labels$colour <- "Penalty"
+  
+  ggsave(plot=vs_plot,
+         filename='figures/vs_plot.jpg',
+         dpi=1500,
+         units='in',
+         width = 7,
+         height = 8)
+  
+  pve_snr_df <- all_experiments_rbound[,c("penalty", "n_train", "pve", "snr")]
+  pve_noise_plot <- ggplot(
+    data=pve_snr_df,
+    aes(x=pve,y=snr, colour=penalty))+
+    geom_point()+
+    facet_grid(penalty~n_train)+
+    ylab("Signal:Noise Ratio")+
+    xlab("Proportion of Variance Explained")+
+    geom_vline(xintercept=0, linetype="dashed")+
+    theme(legend.position = "None")+
+    scale_color_brewer(palette = "Dark2")
+  
+  ggsave(plot=pve_noise_plot,
+         filename='figures/pve_noise_plot.jpg',
+         dpi=1500,
+         units='in',
+         width = 7,
+         height = 8)
+  
+  
+
+  
+
+}
+
+#result tables
+if(T){
+  
+  all_performance_metrics <- c(reg_metrics, vs_metrics, "n_nonzero_coefs_hat")
+  all_performance_metrics_verbose <-c("Relative risk", "Relative test error", "Proportion of variance explained",
+                                      "Precision", "Recall", "F1 score", "Coefficient Similarity", "Nonzero Coefficients")
+  all_performance_summary <- all_experiments_melted[all_experiments_melted$metric%in%all_performance_metrics, ]
+  all_performance_summary$metric <- all_performance_metrics_verbose[
+    factor(all_performance_summary$metric, levels=all_performance_metrics)]
+  
+  median_performance <- aggregate(all_performance_summary$value,
+                                  by=all_performance_summary[,c("penalty","n_train", "metric")],
+                                  FUN=function(i){
+                                    formatC(median(i), digits=2, format="f")
+                                  })
+  colnames(median_performance)[4] <- "Median"
+  median_performance$IQR <- aggregate(all_performance_summary$value,
+                               by=all_performance_summary[,c("penalty","n_train", "metric")],
+                               FUN=function(i){
+                                 iqr=formatC(quantile(i, probs = c(0.25, 0.75)), digits=2, format="f")
+                                 paste0("[", iqr[1], ", ", iqr[2], "]")
+                               })$x
+  
+  total_median_performance <- aggregate(all_experiments_melted$value,
+                                        by=all_experiments_melted[,c("penalty", "metric")],
+                                        FUN=median)
+  
+  all_performance_summary <- median_performance
+  colnames(all_performance_summary)[1:3]<- c("Penalty", "N", "Metric")
+  all_performance_summary$N <- gsub("n=", "",all_performance_summary$N)
+  write.table(all_performance_summary,
+            file='tables/all_performance_summary.tsv',
+            row.names = F,
+            sep='\t')
+  
+  pve_snr_test <- cor.test(all_experiments_rbound$snr, all_experiments_rbound$pve)
+  pve_snr_test_text <- paste0("($\rho$: ", round(pve_snr_test$estimate, 2),
+                              ", 95% CI: [",  round(pve_snr_test$conf.int[1], 2),
+                              ", ", round(pve_snr_test$conf.int[2], 2),
+                              "], _P_", format.pval(pve_snr_test$p.value, digits=2)
+  )
+  
+  all_performance_summary2 <- 
+  
+}
+
+#Reporting functions
+if(T){
+  all_datasets <- unique(all_experiments_melted$dataset)
+  all_n_train <- unique(all_experiments_melted$n_train)
+  all_penalties <- unique(all_experiments_melted$penalty)
+  sf <- function(metric=NULL,
+                 penalty=all_penalties,
+                 n_train=all_n_train,
+                 dataset=all_datasets,
+                 digits=2){
+    
+    vec <- all_experiments_melted[
+      all_experiments_melted$metric==metric&
+      all_experiments_melted$penalty%in%penalty&
+      all_experiments_melted$n_train%in%n_train&
+      all_experiments_melted$dataset%in%dataset,
+    ]$value
+    vec <- quantile(vec, probs=c(0.5, 0.25, 0.75))
+    vec <- formatC(vec, digits=digits, format="f")
+    vec <- paste0("(Median: ", vec[1], ", IQR: [", vec[2], ", ", vec[3], "])")
+    return(vec)
+  }
+  
+  minf <- function(metric=NULL,
+                 penalty=all_penalties,
+                 n_train=all_n_train,
+                 dataset=all_datasets,
+                 digits=2){
+    
+    vec <- all_experiments_melted[
+      all_experiments_melted$metric==metric&
+        all_experiments_melted$penalty%in%penalty&
+        all_experiments_melted$n_train%in%n_train&
+        all_experiments_melted$dataset%in%dataset,
+    ]$value
+    vec <- quantile(vec, probs=c(0, 0.05))
+    vec <- formatC(vec, digits=digits, format="f")
+    vec <- paste0("(Min: ", vec[1], ", 5th Quantile: ", vec[2], ")")
+    return(vec)
+  }
+  
+  maxf <- function(metric=NULL,
+                   penalty=all_penalties,
+                   n_train=all_n_train,
+                   dataset=all_datasets,
+                   digits=2){
+    
+    vec <- all_experiments_melted[
+      all_experiments_melted$metric==metric&
+        all_experiments_melted$penalty%in%penalty&
+        all_experiments_melted$n_train%in%n_train&
+        all_experiments_melted$dataset%in%dataset,
+    ]$value
+    vec <- quantile(vec, probs=c(1, 0.95))
+    vec <- formatC(vec, digits=digits, format="f")
+    vec <- paste0("(Max: ", vec[1], ", 95th Quantile: ", vec[2], ")")
+    return(vec)
+  }
+  
+  
+}
+
+#save data
+if(T){
+  save.image(file = "comparing_sparse_penalties_23_05_21.RData")
+}
+
