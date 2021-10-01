@@ -1,9 +1,26 @@
 #Comparing Sparse Penalisation Approaches
 
+#make directories for saving
+if(T){
+  
+  if(!dir.exists('figures')){
+    dir.create('figures')
+  }
+  if(!dir.exists('tables')){
+    dir.create('tables')
+  }
+  if(!dir.exists('all_experiments')){
+    dir.create('all_experiments')
+  }
+}
+
 #load libraries
 if(T){
   library(L0Learn)
   library(GEOquery)
+  if(packageVersion("GEOquery")=="2.60.0"){
+    readr::local_edition(1)
+  }
   library(caret)
   library(glmnet)
   library(reshape2)
@@ -36,33 +53,42 @@ if(T){
   rte_func <- function(y, y_hat, noise_var){
     mean((y-y_hat)^2)/noise_var
   }
-
+  
 }
 
 #import data
 if(T){
   
-  if(F){
+  if(T){
+    
+    #Create Temporary File
+    tmp <- tempfile()
     
     #BreastCa
     if(T){
+      message('downloading GSE73002...')
       GSE73002 <- getGEO("GSE73002")
       X_GSE73002 <- t(exprs(GSE73002[[1]]))
     }
     
     #LungCa
     if(T){
+      message('downloading GSE137140...')
       GSE137140 <- getGEO("GSE137140")
       X_GSE137140 <- t(exprs(GSE137140[[1]]))
     }
     
     #HeadNeckCa
     if(T){
-      GSE103322_file <- "D:/Projects/Datasets/GEO/GSE103322_HNSCC_all_data.txt/HNSCC_all_data.txt"
-      GSE103322 <- read.delim(GSE103322_file,
-                              row.names = 1)
+      
+      message('downloading GSE103322...')
+      GSE103322_url <- 'https://www.ncbi.nlm.nih.gov/geo/download/?acc=GSE103322&format=file&file=GSE103322%5FHNSCC%5Fall%5Fdata%2Etxt%2Egz'
+      download.file(GSE103322_url, tmp)
+      GSE103322 <- read.delim(gzfile(tmp),
+                              row.names = 1,
+                              skip=2)
       colnames(GSE103322) <- NULL
-      GSE103322 <- GSE103322[-c(1,2,4,5),]
+      GSE103322 <- GSE103322[-c(2,3),]
       GSE103322[] <- lapply(GSE103322, as.numeric)
       GSE103322 <- as.matrix(GSE103322)
       GSE103322 <- t(GSE103322)
@@ -72,13 +98,16 @@ if(T){
       mean_non_zero <- colMeans(X_GSE103322!=0)
       most_complete_cols <- order(mean_non_zero, decreasing=T)[1:1000]
       X_GSE103322 <- X_GSE103322[,most_complete_cols]
+      
     }
     
     #OvarianCa
     if(T){
-      GSE146026_file <- "D:/Projects/Datasets/GEO/GSE146026_Izar_HGSOC_ascites_10x_log.tsv"
-      GSE146026 <- read.delim( GSE146026_file,
-                               row.names = 1)
+      message('downloading GSE146026...')
+      GSE146026_url <- 'https://www.ncbi.nlm.nih.gov/geo/download/?acc=GSE146026&format=file&file=GSE146026%5FIzar%5FHGSOC%5Fascites%5F10x%5Flog%2Etsv%2Egz'
+      download.file(GSE146026_url, tmp)
+      GSE146026 <- read.delim(gzfile(tmp),
+                              row.names = 1)
       GSE146026 <-  GSE146026[-(1:7),]
       GSE146026[] <- lapply(GSE146026, as.numeric)
       GSE146026 <- as.matrix(GSE146026)
@@ -90,8 +119,10 @@ if(T){
     
     #Astrocytoma
     if(T){
-      GSE89567_file <- "D:/Projects/Datasets/GEO/GSE89567_IDH_A_processed_data.txt"
-      GSE89567 <- read.delim(GSE89567_file,
+      message('downloading GSE89567...')
+      GSE89567_url <- 'https://www.ncbi.nlm.nih.gov/geo/download/?acc=GSE89567&format=file&file=GSE89567%5FIDH%5FA%5Fprocessed%5Fdata%2Etxt%2Egz'
+      download.file(GSE89567_url, tmp)
+      GSE89567 <- read.delim(gzfile(tmp),
                              row.names = 1)
       GSE89567 <- as.matrix(GSE89567)
       X_GSE89567 <- t(GSE89567)
@@ -113,10 +144,17 @@ if(T){
     #perform qr decompostion to retain a full column rank matrix
     data_list <- lapply(data_list, qrdc_func)
     
-    save(data_list, file="data_list_26_04_21.RData")
+    #rename variables and observaations
+    data_list <- lapply(data_list, function(i){
+      colnames(i) <- paste0("v", 1:ncol(i))
+      rownames(i) <- paste0("sample_", 1:nrow(i))
+      return(i)
+    })
+    
+    save(data_list, file="data_list.RData")
   }
-  if(T){
-    load("data_list_26_04_21.RData")
+  if(F){
+    load("data_list.RData")
   }
   
 }
@@ -142,14 +180,16 @@ if(T){
   param_df <- expand.grid(
     dataset = names(data_list),
     n_train = c(25, 75, 150),
-    rep = 1:50,
-    nv=500
+    rep = 1:100,
+    nv=500,
+    n_folds=c(5,10)
   )
 }
 
 #run experiments
 if(T){
   
+  set.seed(0)
   all_experiments_start_time <- Sys.time()
   all_experiments <- list()
   penalty_types <- c("L0", "L0L1", "L0L2", "L1", "L1L2")
@@ -163,6 +203,8 @@ if(T){
     dataset <- params_list$dataset
     type <- params_list$type
     nv <- params_list$nv
+    n_folds <- params_list$n_folds
+    folds <- sample(rep(1:n_folds, length.out=n_train))
     
     #sample training and test data
     X_all <- data_list[[dataset]]
@@ -199,96 +241,67 @@ if(T){
       message(penalty_i)
       
       #Train Model
-      if(penalty_i=="L0"){
+      if(penalty_i%in%c("L0", "L0L1", "L0L2")){
+        
         start_time <- Sys.time()
-        cv_fit <- L0Learn.cvfit(x=X_train,
+        full_mod <- L0Learn.fit(x=X_train,
                                 y=y_train,
                                 penalty=penalty_i,
                                 loss="SquaredError",
-                                nFolds=5,
-                                intercept=F
-        )
+                                intercept=F)
+        hp_grid <- cbind(
+          lambda=unlist(full_mod$lambda),
+          gamma=rep(full_mod$gamma,
+                    times=sapply(full_mod$lambda,
+                                 length)))
+        
+        
+        cv_mses <- lapply(1:n_folds, function(fold_i){
+          X_tt <- X_train[folds!=fold_i,]
+          X_tv <- X_train[folds==fold_i,]
+          y_tt <- y_train[folds!=fold_i]
+          y_tv <- y_train[folds==fold_i]
+          mod_i <- L0Learn.fit(x=X_tt,
+                               y=y_tt,
+                               penalty=penalty_i,
+                               loss="SquaredError",
+                               intercept=F,
+                               lambdaGrid=full_mod$lambda)
+          cv_mse_i <- sapply(1:nrow(hp_grid), function(hp_i){
+            yhat_i <- predict(mod_i,
+                              X_tv,
+                              lambda=hp_grid[hp_i,1],
+                              gamma=hp_grid[hp_i,2]
+            )
+            cv_mse_ij <- mean((yhat_i-y_tv)^2)
+            return(cv_mse_ij)
+          })
+          return(cv_mse_i)
+        })
+        cv_mses <- Reduce("+", cv_mses)/n_folds
+        cv_err <- min(cv_mses)
+        selected_params <- hp_grid[which.min(cv_mses),]
         run_time <- difftime(Sys.time(),
                              start_time,
                              units = "secs")
-        
-        rm(.Random.seed, envir=globalenv())
-        
-        opt_lambda_idx <-  which.min((cv_fit$cvMeans)[[1]])[1]
-        opt_lambda <- lambda_vec[opt_lambda_idx]
-        opt_gamma <- 0
+        opt_lambda <- selected_params[1]
+        opt_gamma <- selected_params[2]
         
         nonzero_L0 <- opt_lambda>0
-        nonzero_L1 <- F
-        nonzero_L2 <- F
-        
-        beta_hat <- coef(cv_fit, lambda=opt_lambda, gamma=opt_gamma)
-        
-        #multiple models may be returned if they have equivalent coefficients
-        if(ncol(beta_hat)>1){
-          beta_hat <- c(beta_hat[,1])
-        }else{
-          beta_hat <- c(as.matrix(beta_hat))
+        if(penalty_i=="L0"){
+          nonzero_L1 <- F
+          nonzero_L2 <- F
         }
-      }
-      if(penalty_i=="L0L1"){
-        start_time <- Sys.time()
-        cv_fit <- L0Learn.cvfit(x=X_train,
-                                y=y_train,
-                                penalty=penalty_i,
-                                loss="SquaredError",
-                                nFolds=5,
-                                intercept=F
-        )
-        run_time <- difftime(Sys.time(),
-                             start_time,
-                             units = "secs")
-        
-        rm(.Random.seed, envir=globalenv())
-        
-        opt_gamma_idx <- which.min(sapply(cv_fit$cvMeans, min))[1]
-        opt_lambda_idx <-  which.min(cv_fit$cvMeans[[opt_gamma_idx]])[1]
-        opt_gamma <- cv_fit$fit$gamma[opt_gamma_idx]
-        opt_lambda <- cv_fit$fit$lambda[[opt_gamma_idx]][opt_lambda_idx]
-        
-        nonzero_L0 <- opt_lambda>0
-        nonzero_L1 <- opt_gamma>0
-        nonzero_L2 <- F
-        
-        beta_hat <- coef(cv_fit, lambda=opt_lambda, gamma=opt_gamma)
-        
-        #multiple models may be returned if they have equivalent coefficients
-        if(ncol(beta_hat)>1){
-          beta_hat <- c(beta_hat[,1])
-        }else{
-          beta_hat <- c(as.matrix(beta_hat))
+        if(penalty_i=="L0L1"){
+          nonzero_L1 <- opt_gamma > 0
+          nonzero_L2 <- F
         }
-      }
-      if(penalty_i=="L0L2"){
-        start_time <- Sys.time()
-        cv_fit <- L0Learn.cvfit(x=X_train,
-                                y=y_train,
-                                penalty=penalty_i,
-                                loss="SquaredError",
-                                nFolds=5,
-                                intercept=F
-        )
-        run_time <- difftime(Sys.time(),
-                             start_time,
-                             units = "secs")
+        if(penalty_i=="L0L2"){
+          nonzero_L1 <- F
+          nonzero_L2 <- opt_gamma > 0
+        }
         
-        rm(.Random.seed, envir=globalenv())
-        
-        opt_gamma_idx <- which.min(sapply(cv_fit$cvMeans, min))[1]
-        opt_lambda_idx <-  which.min(cv_fit$cvMeans[[opt_gamma_idx]])[1]
-        opt_gamma <- cv_fit$fit$gamma[opt_gamma_idx]
-        opt_lambda <- cv_fit$fit$lambda[[opt_gamma_idx]][opt_lambda_idx]
-        
-        nonzero_L0 <- opt_lambda>0
-        nonzero_L1 <- F
-        nonzero_L2 <- opt_gamma>0
-        
-        beta_hat <- coef(cv_fit, lambda=opt_lambda, gamma=opt_gamma)
+        beta_hat <- coef(full_mod, lambda=opt_lambda, gamma=opt_gamma)
         
         #multiple models may be returned if they have equivalent coefficients
         if(ncol(beta_hat)>1){
@@ -298,23 +311,25 @@ if(T){
         }
       }
       if(penalty_i=="L1"){
-      
-      start_time <- Sys.time()
-      cv_fit <- cv.glmnet(x=X_train,
-                          y=y_train,
-                          nfolds=5,
-                          intercept=F,
-                          lambda.min.ratio=1e-4)
-      run_time <- difftime(Sys.time(),
-                           start_time,
-                           units = "secs")
-      opt_lambda <- cv_fit$lambda.min
-      beta_hat <- as.matrix(coef(cv_fit, lambda=opt_lambda))[-1]
-
-      nonzero_L0 <- F
-      nonzero_L1 <- opt_lambda>0
-      nonzero_L2 <- F
-      
+        
+        start_time <- Sys.time()
+        cv_fit <- cv.glmnet(x=X_train,
+                            y=y_train,
+                            foldid=folds,
+                            intercept=F,
+                            lambda.min.ratio=1e-4
+        )
+        run_time <- difftime(Sys.time(),
+                             start_time,
+                             units = "secs")
+        opt_lambda <- cv_fit$lambda.min
+        cv_err <- cv_fit$cvm[cv_fit$lambda==opt_lambda]
+        beta_hat <- as.matrix(coef(cv_fit, lambda=opt_lambda))[-1]
+        
+        nonzero_L0 <- F
+        nonzero_L1 <- opt_lambda>0
+        nonzero_L2 <- F
+        
       }
       if(penalty_i=="L1L2"){
         
@@ -322,7 +337,7 @@ if(T){
         alpha_vec <- seq(from=0,
                          to=1,
                          length.out=10)
-        foldid <- sample(rep(1:5, length.out=n_train))
+        foldid <- sample(rep(1:n_folds, length.out=n_train))
         cv_fits <- lapply(alpha_vec, function(alpha_i){
           cv.glmnet(x=X_train,
                     y=y_train,
@@ -338,23 +353,20 @@ if(T){
         opt_alpha_idx <- which.min(sapply(cv_fits, function(cv_fit_i){
           min(cv_fit_i$cvm)[1]
         }))[1]
-        
         cv_fit <- cv_fits[[opt_alpha_idx]]
+        opt_lambda <- cv_fit$lambda.min
+        cv_err <- cv_fit$cvm[cv_fit$lambda==opt_lambda]
         beta_hat <- as.matrix(coef(cv_fit))[-1]
         
         nonzero_L0 <- F
-        nonzero_L1 <- opt_lambda>0 & (opt_alpha_idx>0)
-        nonzero_L2 <- opt_lambda>0 & (opt_alpha_idx<1)
+        nonzero_L1 <- opt_lambda>0 & (opt_alpha_idx<1)
+        nonzero_L2 <- opt_lambda>0 & (opt_alpha_idx>0)
         
       }
       
       #make predictions
-      y_test_hat <- c(as.matrix(predict(
-        object=cv_fit,
-        newx=X_test,
-        lambda=opt_lambda,
-        gamma=opt_gamma,
-        alpha=opt_alpha)))
+      y_test_hat <- X_test %*% as.matrix(beta_hat)
+      
       
       #measure test performance
       rr_test <- rr_func(opt_y_hat = y_test_opt,
@@ -392,7 +404,8 @@ if(T){
                           n_nonzero_coefs_hat = sum(beta_hat!=0),
                           nonzero_L0=nonzero_L0,
                           nonzero_L1=nonzero_L1,
-                          nonzero_L2=nonzero_L2
+                          nonzero_L2=nonzero_L2,
+                          cv_err=cv_err
       )
       return(output_list)
     })
@@ -406,18 +419,18 @@ if(T){
   all_experiments_run_time <-  difftime(Sys.time(),
                                         all_experiments_start_time,
                                         units = "hours")
-
+  
   
 }
 
 #save experiments
 if(T){
-  save(all_experiments, file="all_experiments_25_05_21.RData")
+  save(all_experiments, file="all_experiments.RData")
 }
 
 #reload experiments
 if(T){
-  load("all_experiments_25_05_21.RData")
+  load("all_experiments.RData")
 }
 
 #reformat experiment data
@@ -433,7 +446,7 @@ if(T){
   all_experiments_melted <- melt(all_experiments_melted, id=c("experiment", "penalty", "n_train","dataset"))
   colnames(all_experiments_melted)<- gsub("variable", "metric",
                                           colnames(all_experiments_melted)) 
-
+  
   all_experiments_melted$value[is.na(all_experiments_melted$value)&
                                  all_experiments_melted$metric%in%c(
                                    "precision", "recall", "f1", "beta_similarity"
@@ -445,6 +458,128 @@ if(T){
                                  )
   ] <- 0
   all_experiments_melted$metric <- gsub("beta_similarity", "coefficient_similarity", all_experiments_melted$metric )
+  
+  
+}
+
+#compare performance of preselection and preselection validation
+if(T){
+  
+  #identify optimal models using other datasets
+  preselected_methods <- all_experiments_melted[,c("dataset", "n_train", "metric")]
+  preselected_methods <- preselected_methods[!duplicated(preselected_methods),]
+  comparison_metrics <- c("pve", "f1", "coefficient_similarity")
+  preselected_methods <- preselected_methods[preselected_methods$metric %in% comparison_metrics,]
+  preselected_methods$method <- sapply(1:nrow(preselected_methods), function(i){
+    
+    params_i <- preselected_methods[i,]
+    
+    relevant_experiments <- all_experiments_melted[
+      all_experiments_melted$dataset!=params_i$dataset&
+        all_experiments_melted$n_train==params_i$n_train&
+        all_experiments_melted$metric==params_i$metric,]
+    relevant_experiments$value_rank <- NA
+    #rank selection method performance for each experiment
+    for(start_i in seq(1, nrow(relevant_experiments), 5)){
+      idx_i <- start_i:(start_i + 4)
+      relevant_experiments$value_rank[idx_i] <- rank(relevant_experiments$value[idx_i])
+    }
+    #select the best overall model for the experimental conditions
+    method_scores <- aggregate(relevant_experiments$value_rank,
+                               by=relevant_experiments[,"penalty", drop=F],
+                               FUN=mean)
+    selected_method <- method_scores$penalty[which.max(method_scores$x)]
+    return(selected_method)
+  })
+  
+  #Extract performance of preselected and internally selected models
+  preselected_vs_internal_performance <- lapply(all_experiments, function(experiment_i){
+    
+    colnames(experiment_i) <- gsub("beta_similarity",
+                                   "coefficient_similarity",
+                                   colnames(experiment_i))
+    colnames(experiment_i) <- gsub("F1",
+                                   "f1",
+                                   colnames(experiment_i))
+    
+    comparison_i <- preselected_methods[
+      preselected_methods$dataset==experiment_i$dataset[1]&
+        preselected_methods$n_train==paste0("n=", experiment_i$n_train[1]),
+    ]
+    colnames(comparison_i)[4] <- "preselection_method"
+    
+    comparison_i$preselection_performance <- as.numeric(experiment_i[cbind(
+      match(comparison_i$preselection_method, experiment_i$penalty),
+      match(comparison_i$metric, colnames(experiment_i), )
+    )])
+    comparison_i$internal_method <- experiment_i$penalty[which.min(experiment_i$cv_err)]
+    
+    comparison_i$internal_performance <- unlist(experiment_i[
+      which.min(experiment_i$cv_err),
+      match(comparison_i$metric, colnames(experiment_i))
+    ])
+    comparison_i$preselection_performance[is.nan(comparison_i$preselection_performance)]<- 0
+    comparison_i$preselection_performance[is.na(comparison_i$preselection_performance)]<- 0
+    comparison_i$internal_performance[is.nan(comparison_i$internal_performance)]<- 0
+    comparison_i$internal_performance[is.na(comparison_i$internal_performance)]<- 0
+    
+    return(comparison_i)
+    
+  })
+  preselected_vs_internal_performance <- do.call(rbind,
+                                                 preselected_vs_internal_performance)
+  preselected_vs_internal_performance$best_selector <- 
+    ifelse(preselected_vs_internal_performance$preselection_performance>
+             preselected_vs_internal_performance$internal_performance,
+           "preselection",
+           "internal_validation")
+  preselected_vs_internal_performance$best_selector[
+    preselected_vs_internal_performance$preselection_performance==
+      preselected_vs_internal_performance$internal_performance
+  ] <- "equivalent"
+  
+  #Compare preselected results to models selected by internal validation
+  comparison_tests <- lapply(comparison_metrics, function(metric_i){
+    
+    preselection_performance_i  <-
+      preselected_vs_internal_performance$preselection_performance[
+        preselected_vs_internal_performance$metric==metric_i
+      ]
+    internal_performance_i <-
+      preselected_vs_internal_performance$internal_performance[
+        preselected_vs_internal_performance$metric==metric_i
+      ]
+    
+    test_i <- t.test(preselection_performance_i,
+                          internal_performance_i,
+                          paired = T,
+                          alternative = "two.sided",
+                          conf.int = T
+    )
+    output_i <- data.frame(
+      metric=metric_i,
+      t=format(round(test_i$statistic, 2), nsmall=2),
+      df=test_i$parameter,
+      Diff= paste0(format(round(test_i$estimate, 3), nsmall=3)," [",
+                   format(round(test_i$conf.int[1], 3), nsmall=3), ", ",
+                   format(round(test_i$conf.int[2], 3), nsmall=3), "]"),
+      p=test_i$p.value
+    )
+    return(output_i)
+  })
+  comparison_tests <- do.call(rbind, comparison_tests)
+  write.table(comparison_tests,
+              file='tables/preselection_comparison_tests.tsv',
+              row.names = F,
+              sep='\t')
+  
+  comparison_df <- preselected_vs_internal_performance[c("metric",
+                                                         "preselection_performance",
+                                                         "internal_performance")]
+  comparison_df$difference <- comparison_df$preselection_performance - comparison_df$internal_performance
+  comparison_df$metric2 <- c("Proportion Variance Explained","F1", "Coefficient Similarity")[factor(comparison_df$metric,
+                                                               levels=c( "pve", "f1", "coefficient_similarity")
+                                                               )]
 
   
 }
@@ -452,32 +587,31 @@ if(T){
 #plotting
 if(T){
   
-  
-  reg_metrics <- c("rr", "rte", "pve")
+  reg_metrics <- c("rr", "pve")
   reg_df <- all_experiments_melted[all_experiments_melted$metric%in%reg_metrics,]
-  reg_df$metric2 <- factor(c("Proportion of Variance Explained", "Relative Risk", "Relative Test Error")[factor(reg_df$metric)])
+  reg_df$metric2 <- factor(c("Proportion Variance Explained", "Relative Risk")[factor(reg_df$metric)])
   reg_plot <- ggplot(
     data=reg_df,
     aes(x=n_train,y=value, colour=penalty))+
     geom_boxplot(coef=NULL)+
-    facet_grid(metric2~., scales="free_y")+
+    facet_grid(metric2~.,  scales="free_y")+
     ylab(NULL)+
     xlab(NULL)+
     scale_color_brewer(palette = "Dark2")
   reg_plot$labels$colour <- "Penalty"
   
   ggsave(plot=reg_plot,
-         filename='figures/reg_plot.jpg',
-         dpi=1500,
+         filename='figures/reg_plot.tiff',
+         dpi=300,
          units='in',
-         width = 7,
-         height = 6)
+         width = 5,
+         height = 5)
   
   vs_metrics <- c("precision","recall","f1","coefficient_similarity")
   vs_df <- all_experiments_melted[all_experiments_melted$metric%in%vs_metrics,]
   vs_df$metric2 <- factor(c("Coefficient Similarity", "F1 Score", "Precision", "Recall")[factor(vs_df$metric)],
                           levels = c("Coefficient Similarity", "Precision", "Recall","F1 Score")
-                          )
+  )
   vs_plot <- ggplot(
     data=vs_df,
     aes(x=n_train,y=value, colour=penalty))+
@@ -489,11 +623,11 @@ if(T){
   vs_plot$labels$colour <- "Penalty"
   
   ggsave(plot=vs_plot,
-         filename='figures/vs_plot.jpg',
-         dpi=1500,
+         filename='figures/vs_plot.tiff',
+         dpi=300,
          units='in',
-         width = 7,
-         height = 8)
+         width = 5,
+         height = 6)
   
   pve_snr_df <- all_experiments_rbound[,c("penalty", "n_train", "pve", "snr")]
   pve_noise_plot <- ggplot(
@@ -508,16 +642,28 @@ if(T){
     scale_color_brewer(palette = "Dark2")
   
   ggsave(plot=pve_noise_plot,
-         filename='figures/pve_noise_plot.jpg',
-         dpi=1500,
+         filename='figures/pve_noise_plot.tiff',
+         dpi=300,
          units='in',
-         width = 7,
-         height = 8)
+         width = 5,
+         height = 6)
+    
+  comparison_ecdf_plot <- 
+    ggplot(comparison_df, aes(x=difference)) +
+    stat_ecdf(geom="step",color="red", size=0.8)+
+    geom_vline(xintercept=0, linetype=2)+
+    facet_wrap(metric2~., scales="free")+
+    xlab("Preselection Performance Minus Internal Validation Performance")+
+    ylab("Quantile")
+  ggsave(plot=comparison_ecdf_plot,
+         filename='figures/comparison_ecdf_plot.tiff',
+         dpi=300,
+         units='in',
+         width = 8,
+         height = 4)
   
   
-
   
-
 }
 
 #result tables
@@ -537,11 +683,11 @@ if(T){
                                   })
   colnames(median_performance)[4] <- "Median"
   median_performance$IQR <- aggregate(all_performance_summary$value,
-                               by=all_performance_summary[,c("penalty","n_train", "metric")],
-                               FUN=function(i){
-                                 iqr=formatC(quantile(i, probs = c(0.25, 0.75)), digits=2, format="f")
-                                 paste0("[", iqr[1], ", ", iqr[2], "]")
-                               })$x
+                                      by=all_performance_summary[,c("penalty","n_train", "metric")],
+                                      FUN=function(i){
+                                        iqr=formatC(quantile(i, probs = c(0.25, 0.75)), digits=2, format="f")
+                                        paste0("[", iqr[1], ", ", iqr[2], "]")
+                                      })$x
   
   total_median_performance <- aggregate(all_experiments_melted$value,
                                         by=all_experiments_melted[,c("penalty", "metric")],
@@ -550,10 +696,29 @@ if(T){
   all_performance_summary <- median_performance
   colnames(all_performance_summary)[1:3]<- c("Penalty", "N", "Metric")
   all_performance_summary$N <- gsub("n=", "",all_performance_summary$N)
+  
+  
+  predictive_performance_summary <- all_performance_summary[
+    all_performance_summary$Metric %in%
+    c("Relative risk", "Relative test error", "Proportion of variance explained"),
+  ]
+  vs_performance_summary <- all_performance_summary[
+    all_performance_summary$Metric %in%
+    c("Precision", "Recall", "F1 score", "Coefficient Similarity", "Nonzero Coefficients"),
+  ]
+  
   write.table(all_performance_summary,
-            file='tables/all_performance_summary.tsv',
-            row.names = F,
-            sep='\t')
+              file='tables/all_performance_summary.tsv',
+              row.names = F,
+              sep='\t')
+  write.table(predictive_performance_summary,
+              file='tables/predictive_performance_summary.tsv',
+              row.names = F,
+              sep='\t')
+  write.table(vs_performance_summary,
+              file='tables/vs_performance_summary.tsv',
+              row.names = F,
+              sep='\t')
   
   pve_snr_test <- cor.test(all_experiments_rbound$snr, all_experiments_rbound$pve)
   pve_snr_test_text <- paste0("($\rho$: ", round(pve_snr_test$estimate, 2),
@@ -562,7 +727,6 @@ if(T){
                               "], _P_", format.pval(pve_snr_test$p.value, digits=2)
   )
   
-  all_performance_summary2 <- 
   
 }
 
@@ -579,9 +743,9 @@ if(T){
     
     vec <- all_experiments_melted[
       all_experiments_melted$metric==metric&
-      all_experiments_melted$penalty%in%penalty&
-      all_experiments_melted$n_train%in%n_train&
-      all_experiments_melted$dataset%in%dataset,
+        all_experiments_melted$penalty%in%penalty&
+        all_experiments_melted$n_train%in%n_train&
+        all_experiments_melted$dataset%in%dataset,
     ]$value
     vec <- quantile(vec, probs=c(0.5, 0.25, 0.75))
     vec <- formatC(vec, digits=digits, format="f")
@@ -590,10 +754,10 @@ if(T){
   }
   
   minf <- function(metric=NULL,
-                 penalty=all_penalties,
-                 n_train=all_n_train,
-                 dataset=all_datasets,
-                 digits=2){
+                   penalty=all_penalties,
+                   n_train=all_n_train,
+                   dataset=all_datasets,
+                   digits=2){
     
     vec <- all_experiments_melted[
       all_experiments_melted$metric==metric&
@@ -629,7 +793,7 @@ if(T){
 }
 
 #save data
-if(T){
-  save.image(file = "comparing_sparse_penalties_23_05_21.RData")
+if(F){
+  save.image(file = "comparing_sparse_penalties.RData")
 }
 
